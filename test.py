@@ -78,6 +78,203 @@ def predict_location(heatmap):
 
         return x, y, w, h
 
+
+
+def predict_location_bbox(heatmap, f_i=None, bbox_seq=None, img_scaler=None, threshold=0, max_distance=100.0):
+    """
+    Get coordinates from heatmap, prefer proximity to a given bbox center.
+
+    Args:
+        heatmap (numpy.ndarray): A single heatmap (H, W)
+        f_i (int): Frame index
+        bbox_seq (BBoxSequence): Object containing bbox data
+        img_scaler (tuple): (x_scale, y_scale) to scale from image to heatmap space
+        threshold (float): Binarization threshold
+        max_distance (float or None): Max acceptable distance from main bbox center (in heatmap pixels)
+
+    Returns:
+        (x, y, w, h) (Tuple[int, int, int, int]): predicted bbox from heatmap
+    """
+    if np.amax(heatmap) == 0:
+        return 0, 0, 0, 0
+    else:
+        h, w = heatmap.shape
+        
+        frame = bbox_seq.get_main_person_frame(int(f_i))
+        x1, y1, x2, y2 = frame["boxes"]
+        # print(int(f_i), (x1 + x2) / 2, (y1 + y2) / 2)
+        
+        # Set reference center
+        cx_ref = int((x1 + x2) / 2 / img_scaler[0])
+        cy_ref = int((y1 + y2) / 2 / img_scaler[1])
+
+        # Binarize heatmap
+        binary = (heatmap > threshold).astype(np.uint8) * 255
+        
+        # Find contours
+        (cnts, _) = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        rects = [cv2.boundingRect(ctr) for ctr in cnts]
+
+        if not rects:
+            return 0, 0, 0, 0
+        
+        # Compute candidates
+        candidates = []
+        for rect in rects:
+            x, y, ww, hh = rect
+            cx = x + ww // 2
+            cy = y + hh // 2
+            dx = abs(cx - cx_ref)
+            dy = abs(cy - cy_ref)
+            distance = np.sqrt(dx**2 + dy**2)
+            candidates.append((distance, (x, y, ww, hh)))
+
+        # Sort by distance
+        candidates.sort()
+
+        # Return best candidate
+        best_distance, best_bbox = candidates[0]
+        
+        if max_distance is not None and best_distance > max_distance:
+            return 0, 0, 0, 0
+        
+        return best_bbox
+    
+class BBoxSequence:
+    def __init__(self, boxes_np, scores_np, frame_mask, person_id):
+        self.boxes = boxes_np  # (T, B, 4)
+        self.scores = scores_np  # (T, B)
+        self.mask = frame_mask  # (T, B)
+        self.num_frames, self.num_people, _ = boxes_np.shape
+        self.person_id = person_id
+
+    def get_frame(self, frame_id):
+        if frame_id >= self.num_frames:
+            raise IndexError("Frame index out of range.")
+        return {
+            "boxes": self.boxes[frame_id],
+            "scores": self.scores[frame_id],
+            "mask": self.mask[frame_id]
+        }
+
+    def get_person(self, person_id):
+        if person_id >= self.num_people:
+            raise IndexError("Person index out of range.")
+        return {
+            "boxes": self.boxes[:, person_id],
+            "scores": self.scores[:, person_id],
+            "mask": self.mask[:, person_id]
+        }
+        
+    def get_person_frame(self, person_id, frame_id):
+        if person_id >= self.num_people or frame_id >= self.num_frames:
+            raise IndexError("Person or frame index out of range.")
+        # print("id: ", person_id)
+        return {
+            "boxes": self.boxes[frame_id, person_id],
+            "scores": self.scores[frame_id, person_id],
+            "mask": self.mask[frame_id, person_id]
+        }
+        
+    def get_main_person_frame(self, frame_id):
+        if self.person_id is None:
+            raise ValueError("person_id is not set for this BBoxSequence.")
+        return self.get_person_frame(self.person_id, frame_id)
+
+    def __getitem__(self, frame_id):
+        return self.get_frame(frame_id)
+
+    def __len__(self):
+        return self.num_frames
+
+    @classmethod
+    def load_bbox(cls, video_file, frame_len, image_size=(1920, 1200)):
+        if video_file is None:
+            raise ValueError("video_file cannot be None.")
+        
+        filename = os.path.splitext(os.path.basename(video_file))[0]
+        
+        # load track
+        tracks_path = os.path.join(f"slahmr_data/{video_file.split('/')[0]}/tram_preprocess", filename, 'tracks.npy')
+        if not os.path.exists(tracks_path):
+            raise FileNotFoundError(f"{tracks_path} not found.")
+        tracks = np.load(tracks_path, allow_pickle=True).item()
+        
+        # max people
+        max_people = 10
+        frame_len = frame_len
+        # np array - shape (frame_len, people,)
+        boxes_np = np.zeros((frame_len, max_people, 4)) # T,B,4
+        scores_np = np.zeros((frame_len, max_people)) # T,B
+        # initialize frame mask to False
+        frame_mask = np.zeros((frame_len, max_people), dtype=bool) # T,B
+        
+        # sort tracks
+        tid = [k for k in tracks.keys()]
+        lens = [len(trk) for trk in tracks.values()]
+        rank = np.argsort(lens)[::-1]
+        sorted_tracks = {tid[r]: tracks[tid[r]] for r in rank}
+        
+        all_boxes = []
+        all_frames = []
+        # run through tracks
+        for idx,track_id in enumerate(sorted_tracks.keys()):
+            track = sorted_tracks[track_id]
+            # print(f"Track {track_id}: Length = {len(track)}")
+            
+            bboxes = []
+            frames = []
+            # single track for a person 
+            for t in track: # track 包含所由frame的資訊 iterate through each frame
+                frame = t['frame']
+                bbox = t['det_box']
+                bboxes.append(bbox)
+                frames.append(frame)
+                
+            all_boxes.append(bboxes)
+            all_frames.append(frames)
+            
+            # consider only the first 5 people
+            if idx+1 >= max_people:
+                break
+            
+        num_people = len(all_boxes)
+        print('Number of people:', num_people)
+        
+        # put data into np array
+        for i in range(num_people):
+            for j in range(len(all_boxes[i])): # all_boxes[i][j] shape (1,5)
+                x1, y1, x2, y2, score = all_boxes[i][j][0]
+                boxes_np[all_frames[i][j], i] = [x1, y1, x2, y2]
+                scores_np[all_frames[i][j], i] = score
+                frame_mask[all_frames[i][j], i] = True
+
+        img_w, img_h = image_size
+        cx_center = img_w / 2
+        cy_center = img_h / 2
+
+        min_dist = float('inf')
+        person_id = None
+
+        for i in range(max_people):
+            if not frame_mask[0, i]:
+                continue
+            x1, y1, x2, y2 = boxes_np[0, i]
+            cx = (x1 + x2) / 2
+            cy = (y1 + y2) / 2
+            dist = np.hypot(cx - cx_center, cy - cy_center)
+            if dist < min_dist:
+                min_dist = dist
+                person_id = i
+
+        if person_id is None:
+            raise RuntimeError("No valid bbox found in frame 0 to determine main person.")
+
+
+        # print(f"Selected person {person_id} as closest to center in frame 0.")
+
+        return cls(boxes_np, scores_np, frame_mask, person_id)
+
 def evaluate(indices, y_true=None, y_pred=None, c_true=None, c_pred=None, tolerance=4., img_scaler=(1, 1), output_bbox=False, output_gt=False):
     """ Predict and output the result of each frame.
 
@@ -597,7 +794,8 @@ def test_rally(model, rally_dir, param_dict, save_inpaint_mask=False):
     """
 
     tracknet, inpaintnet = model
-    w, h = Image.open(os.path.join(rally_dir, '0.png')).size
+    # w, h = Image.open(os.path.join(rally_dir, '0.png')).size
+    w, h = 1920, 1200
     if save_inpaint_mask:
         w_scaler, h_scaler = 1., 1.
     else:
@@ -909,7 +1107,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--tracknet_file', type=str, help='file path of the TrackNet model checkpoint')
     parser.add_argument('--inpaintnet_file', type=str, default='', help='file path of the InpaintNet model checkpoint')
-    parser.add_argument('--split', type=str, default='test', choices=['train', 'val', 'test'], help='dataset split for testing')
+    parser.add_argument('--split', type=str, default='val', choices=['train', 'val', 'test'], help='dataset split for testing')
     parser.add_argument('--batch_size', type=int, default=16, help='batch size for testing')
     parser.add_argument('--tolerance', type=float, default=4, help='difference tolerance of center distance between prediction and ground truth in input size')
     parser.add_argument('--eval_mode', type=str, default='weight', choices=['nonoverlap', 'average', 'weight'], help='evaluation mode')
@@ -957,9 +1155,10 @@ if __name__ == '__main__':
         rally_dir = os.path.join(match_dir, 'frame', rally_id)
 
         # Load label
-        csv_file = os.path.join(match_dir, 'corrected_csv', f'{rally_id}_ball.csv') if 'test' in rally_dir else os.path.join(match_dir, 'csv', f'{rally_id}_ball.csv')
-        assert os.path.exists(csv_file), f'{csv_file} does not exist.'
-        label_df = pd.read_csv(csv_file, encoding='utf8').sort_values(by='Frame').fillna(0)
+        # csv_file = os.path.join(match_dir, 'corrected_csv', f'{rally_id}_ball.csv') if 'test' in rally_dir else os.path.join(match_dir, 'csv', f'{rally_id}_ball.csv')
+        # csv_file = os.path.join(match_dir, 'csv', f'{rally_id}_ball.csv')
+        # assert os.path.exists(csv_file), f'{csv_file} does not exist.'
+        # label_df = pd.read_csv(csv_file, encoding='utf8').sort_values(by='Frame').fillna(0)
 
         # Predict label
         pred_dict = test_rally(model, rally_dir, param_dict)
@@ -968,7 +1167,8 @@ if __name__ == '__main__':
         out_video_file = os.path.join(args.save_dir, f'{rally_id}.mp4')
         out_csv_file = os.path.join(args.save_dir, f'{rally_id}_ball.csv')
         frame_list, fps, (w, h) = generate_frames(args.video_file)
-        write_pred_video(frame_list, dict(fps=fps, shape=(w, h)), pred_dict, label_df=label_df, save_file=out_video_file)
+        # write_pred_video(frame_list, dict(fps=fps, shape=(w, h)), pred_dict, label_df=label_df, save_file=out_video_file)
+        write_pred_video(args.video_file, pred_dict, out_video_file, label_df=None)
         write_pred_csv(pred_dict, save_file=out_csv_file)
     else:
         # Evaluation on dataset
@@ -983,7 +1183,7 @@ if __name__ == '__main__':
         pred_dict = test(model, args.split, param_dict, linear_interp=args.linear_interp)
         if args.split == 'test':
             # Drop samples which is not in the effective trajectory
-            res_dict = get_test_res(pred_dict, drop=True)
+            res_dict = get_test_res(pred_dict, drop=False)
         else:
             res_dict = get_test_res(pred_dict, drop=False)
         
@@ -998,7 +1198,7 @@ if __name__ == '__main__':
         if args.output_bbox:
             coco_file = os.path.join(args.save_dir, f'{args.split}_coco_res_{args.eval_mode}.json')
             if args.split == 'test':
-                dect_list = get_coco_res(pred_dict, drop=True)
+                dect_list = get_coco_res(pred_dict, drop=False)
             else:
                 dect_list = get_coco_res(pred_dict, drop=False)
             

@@ -6,12 +6,12 @@ from tqdm import tqdm
 import torch
 from torch.utils.data import DataLoader
 
-from test import predict_location, get_ensemble_weight, generate_inpaint_mask
+from test import predict_location, predict_location_bbox, get_ensemble_weight, generate_inpaint_mask, BBoxSequence
 from dataset import Shuttlecock_Trajectory_Dataset, Video_IterableDataset
 from utils.general import *
 
 
-def predict(indices, y_pred=None, c_pred=None, img_scaler=(1, 1)):
+def predict(indices, y_pred=None, c_pred=None, img_scaler=(1, 1), bbox_seq=None):
     """ Predict coordinates from heatmap or inpainted coordinates. 
 
         Args:
@@ -32,7 +32,7 @@ def predict(indices, y_pred=None, c_pred=None, img_scaler=(1, 1)):
     
     # Transform input for heatmap prediction
     if y_pred is not None:
-        y_pred = y_pred > 0.5
+        y_pred = y_pred > 0.2
         y_pred = y_pred.detach().cpu().numpy() if torch.is_tensor(y_pred) else y_pred
         y_pred = to_img_format(y_pred) # (N, L, H, W)
     
@@ -52,7 +52,8 @@ def predict(indices, y_pred=None, c_pred=None, img_scaler=(1, 1)):
                 elif y_pred is not None:
                     # Predict from heatmap
                     y_p = y_pred[n][f]
-                    bbox_pred = predict_location(to_img(y_p))
+                    # bbox_pred = predict_location(to_img(y_p))
+                    bbox_pred = predict_location_bbox(to_img(y_p), f_i, bbox_seq, img_scaler)
                     cx_pred, cy_pred = int(bbox_pred[0]+bbox_pred[2]/2), int(bbox_pred[1]+bbox_pred[3]/2)
                     cx_pred, cy_pred = int(cx_pred*img_scaler[0]), int(cy_pred*img_scaler[1])
                 else:
@@ -92,7 +93,7 @@ if __name__ == '__main__':
     out_video_file = os.path.join(args.save_dir, f'{video_name}.mp4')
 
     if not os.path.exists(args.save_dir):
-        os.makedirs(args.save_dir)
+        os.makedirs(args.save_dir, exist_ok=True)
     
     # Load model
     tracknet_ckpt = torch.load(args.tracknet_file)
@@ -113,6 +114,7 @@ if __name__ == '__main__':
     w, h = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
     w_scaler, h_scaler = w / WIDTH, h / HEIGHT
     img_scaler = (w_scaler, h_scaler)
+    bbox_seq = BBoxSequence.load_bbox(video_file, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
 
     tracknet_pred_dict = {'Frame':[], 'X':[], 'Y':[], 'Visibility':[], 'Inpaint_Mask':[],
                         'Img_scaler': (w_scaler, h_scaler), 'Img_shape': (w, h)}
@@ -201,7 +203,7 @@ if __name__ == '__main__':
                         ensemble_y_pred = torch.cat((ensemble_y_pred, y_pred.reshape(1, 1, HEIGHT, WIDTH)), dim=0)
 
             # Predict
-            tmp_pred = predict(ensemble_i, y_pred=ensemble_y_pred, img_scaler=img_scaler)
+            tmp_pred = predict(ensemble_i, y_pred=ensemble_y_pred, img_scaler=img_scaler, bbox_seq=bbox_seq)
             for key in tmp_pred.keys():
                 tracknet_pred_dict[key].extend(tmp_pred[key])
 
