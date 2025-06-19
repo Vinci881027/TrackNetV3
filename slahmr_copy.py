@@ -1,9 +1,14 @@
 import os
 import shutil
-    
-match = "241226_1"
+from argparse import ArgumentParser
+
+parser = ArgumentParser(description="Worker script parameters")
+parser.add_argument("--match", type=str, required=True, help="Which match")
+args = parser.parse_args()
+match = args.match
+
 tram_path = f"./slahmr_data/{match}/tram_preprocess"
-tram_path_init = "/mnt/train-data-7-hdd/vinci/slahmr/slahmr/slahmr/tram_preprocess"
+tram_path_init = f"/mnt/train-data-7-hdd/vinci/slahmr/slahmr/slahmr/tram_preprocess_{match}"
 os.makedirs(tram_path, exist_ok=True)
 
 for rally in os.listdir(tram_path_init):
